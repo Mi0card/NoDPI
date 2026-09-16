@@ -13,7 +13,6 @@ import base64
 import json
 import logging
 import os
-import random
 import ssl
 import subprocess
 import sys
@@ -27,6 +26,8 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from urllib.error import URLError
 from urllib.request import urlopen, Request
+
+from utils.autotune import fragment_clienthello, run_autotune
 
 if sys.platform == "win32":
     import winreg
@@ -69,6 +70,7 @@ class ProxyConfig:
         self.log_error_file = None
         self.no_blacklist = False
         self.auto_blacklist = False
+        self.auto_tune = False
         self.quiet = False
         self.start_in_tray = False
 
@@ -738,23 +740,6 @@ class ConnectionHandler(IConnectionHandler):
 
         await self._setup_piping(reader, writer, remote_reader, remote_writer, conn_key)
 
-    def _extract_sni_position(self, data):
-        i = 0
-        while i < len(data) - 8:
-            if all(data[i + j] == 0x00 for j in [0, 1, 2, 4, 6, 7]):
-                ext_len = data[i + 3]
-                server_name_list_len = data[i + 5]
-                server_name_len = data[i + 8]
-                if (
-                    ext_len - server_name_list_len == 2
-                    and server_name_list_len - server_name_len == 3
-                ):
-                    sni_start = i + 9
-                    sni_end = sni_start + server_name_len
-                    return sni_start, sni_end
-            i += 1
-        return None
-
     async def _handle_initial_tls_data(
         self,
         reader: asyncio.StreamReader,
@@ -792,56 +777,7 @@ class ConnectionHandler(IConnectionHandler):
         self.statistics.increment_total_connections()
         self.statistics.increment_blocked_connections()
 
-        parts = []
-
-        if self.config.fragment_method == "sni":
-            sni_pos = self._extract_sni_position(data)
-
-            if sni_pos:
-                part_start = data[: sni_pos[0]]
-                sni_data = data[sni_pos[0]: sni_pos[1]]
-                part_end = data[sni_pos[1]:]
-
-                parts.append(
-                    bytes.fromhex("160304")
-                    + len(part_start).to_bytes(2, "big")
-                    + part_start
-                )
-                for i in range(0, len(sni_data), 2):
-                    chunk = sni_data[i: i + 2]
-                    parts.append(
-                        bytes.fromhex("160304")
-                        + len(chunk).to_bytes(2, "big")
-                        + chunk
-                    )
-                parts.append(
-                    bytes.fromhex("160304")
-                    + len(part_end).to_bytes(2, "big")
-                    + part_end
-                )
-
-        elif self.config.fragment_method == "random":
-            host_end = data.find(b"\x00")
-            if host_end != -1:
-                part_data = (
-                    bytes.fromhex("160304")
-                    + (host_end + 1).to_bytes(2, "big")
-                    + data[: host_end + 1]
-                )
-                parts.append(part_data)
-                data = data[host_end + 1:]
-
-            while data:
-                chunk_len = random.randint(1, len(data))
-                part_data = (
-                    bytes.fromhex("160304")
-                    + chunk_len.to_bytes(2, "big")
-                    + data[:chunk_len]
-                )
-                parts.append(part_data)
-                data = data[chunk_len:]
-
-        combined_parts = b"".join(parts)
+        combined_parts = fragment_clienthello(data, self.config.fragment_method)
         writer.write(combined_parts)
         await writer.drain()
 
@@ -1245,6 +1181,7 @@ class ConfigLoader:
         config.log_error_file = args.log_error
         config.no_blacklist = args.no_blacklist
         config.auto_blacklist = args.autoblacklist
+        config.auto_tune = args.auto_tune
         config.quiet = args.quiet
         config.start_in_tray = args.start_in_tray
         return config
@@ -1418,6 +1355,13 @@ class ProxyApplication:
             choices=["loose", "strict"],
             help="Domain matching mode (strict by default)",
         )
+        parser.add_argument(
+            "--auto-tune",
+            action="store_true",
+            help="On startup, probe fragmentation methods against test domains "
+                 "and automatically use whichever gets past local DPI "
+                 "(overrides --fragment-method if it finds a working one)",
+        )
 
         parser.add_argument(
             "--auth-username", required=False, help="Username for proxy authentication"
@@ -1492,6 +1436,22 @@ class ProxyApplication:
 
         logger.set_error_counter_callback(
             statistics.increment_error_connections)
+
+        if config.auto_tune:
+            logger.info(
+                "\033[92m[INFO]:\033[97m Auto-tune enabled, probing fragmentation methods...")
+            best_method = await run_autotune(logger)
+            if best_method:
+                config.fragment_method = best_method
+                logger.info(
+                    f"\033[92m[INFO]:\033[97m Auto-tune selected fragmentation method: {best_method}")
+            else:
+                logger.error(
+                    f"\033[91m[WARN]:\033[97m Auto-tune found no working fragmentation method "
+                    f"against the test domains; keeping '{config.fragment_method}'. "
+                    f"This may mean your ISP blocks by IP, not just SNI - fragmentation "
+                    f"alone won't help in that case."
+                )
 
         if sys.platform == "win32" and not config.quiet:
             tray = WindowsTrayIcon(tooltip=f"NoDPI v{__version__}")
