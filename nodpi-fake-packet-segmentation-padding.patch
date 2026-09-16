@@ -1,0 +1,560 @@
+diff --git a/src/main.py b/src/main.py
+index 9dead70..2620020 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -28,13 +28,14 @@ from urllib.error import URLError
+ from urllib.request import urlopen, Request
+ 
+ from utils.autotune import fragment_clienthello, run_autotune
++from utils.evasion import pad_clienthello, send_fake_packet, send_segmented
+ 
+ if sys.platform == "win32":
+     import winreg
+ 
+     from utils.tray import WindowsTrayIcon
+ 
+-__version__ = "2.3"
++__version__ = "2.4"
+ 
+ if sys.platform == "win32":
+     os.system("")
+@@ -71,6 +72,10 @@ class ProxyConfig:
+         self.no_blacklist = False
+         self.auto_blacklist = False
+         self.auto_tune = False
++        self.use_padding = False
++        self.padding_size = 1400
++        self.use_fake_packet = False
++        self.fake_ttl = 8
+         self.quiet = False
+         self.start_in_tray = False
+ 
+@@ -777,12 +782,19 @@ class ConnectionHandler(IConnectionHandler):
+         self.statistics.increment_total_connections()
+         self.statistics.increment_blocked_connections()
+ 
+-        combined_parts = fragment_clienthello(data, self.config.fragment_method)
+-        writer.write(combined_parts)
+-        await writer.drain()
++        payload = data
++        if self.config.use_padding:
++            payload = pad_clienthello(payload, self.config.padding_size)
++
++        if self.config.use_fake_packet:
++            await send_fake_packet(writer, self.config.fake_ttl)
+ 
+-        self.statistics.update_traffic(0, len(combined_parts))
+-        conn_info.traffic_out += len(combined_parts)
++        parts = fragment_clienthello(payload, self.config.fragment_method)
++        await send_segmented(writer, parts)
++
++        total_len = sum(len(part) for part in parts)
++        self.statistics.update_traffic(0, total_len)
++        conn_info.traffic_out += total_len
+ 
+     async def _setup_piping(
+         self,
+@@ -1182,6 +1194,10 @@ class ConfigLoader:
+         config.no_blacklist = args.no_blacklist
+         config.auto_blacklist = args.autoblacklist
+         config.auto_tune = args.auto_tune
++        config.use_padding = args.padding
++        config.padding_size = args.padding_size
++        config.use_fake_packet = args.fake_packet
++        config.fake_ttl = args.fake_ttl
+         config.quiet = args.quiet
+         config.start_in_tray = args.start_in_tray
+         return config
+@@ -1362,6 +1378,30 @@ class ProxyApplication:
+                  "and automatically use whichever gets past local DPI "
+                  "(overrides --fragment-method if it finds a working one)",
+         )
++        parser.add_argument(
++            "--padding",
++            action="store_true",
++            help="Pad the ClientHello with a standard RFC 7685 padding extension "
++                 "so it no longer fits in one small packet",
++        )
++        parser.add_argument(
++            "--padding-size",
++            type=int,
++            default=1400,
++            help="Target ClientHello size in bytes when --padding is used (default: 1400)",
++        )
++        parser.add_argument(
++            "--fake-packet",
++            action="store_true",
++            help="Send a low-TTL decoy ClientHello (wrong SNI) before the real one, "
++                 "so on-path DPI reads the wrong domain",
++        )
++        parser.add_argument(
++            "--fake-ttl",
++            type=int,
++            default=8,
++            help="IP TTL for the decoy packet sent by --fake-packet (default: 8)",
++        )
+ 
+         parser.add_argument(
+             "--auth-username", required=False, help="Username for proxy authentication"
+@@ -1440,14 +1480,14 @@ class ProxyApplication:
+         if config.auto_tune:
+             logger.info(
+                 "\033[92m[INFO]:\033[97m Auto-tune enabled, probing fragmentation methods...")
+-            best_method = await run_autotune(logger)
+-            if best_method:
+-                config.fragment_method = best_method
+-                logger.info(
+-                    f"\033[92m[INFO]:\033[97m Auto-tune selected fragmentation method: {best_method}")
++            best = await run_autotune(logger)
++            if best:
++                config.fragment_method = best["fragment_method"]
++                config.use_padding = best["use_padding"]
++                config.use_fake_packet = best["use_fake_packet"]
+             else:
+                 logger.error(
+-                    f"\033[91m[WARN]:\033[97m Auto-tune found no working fragmentation method "
++                    f"\033[91m[WARN]:\033[97m Auto-tune found no working combination "
+                     f"against the test domains; keeping '{config.fragment_method}'. "
+                     f"This may mean your ISP blocks by IP, not just SNI - fragmentation "
+                     f"alone won't help in that case."
+diff --git a/src/utils/autotune.py b/src/utils/autotune.py
+index 5080c03..1060642 100644
+--- a/src/utils/autotune.py
++++ b/src/utils/autotune.py
+@@ -2,9 +2,10 @@
+ Auto-tune
+ =========
+ 
+-Startup self-test that measures which TLS ClientHello fragmentation
+-method gets past the local DPI, so NoDPI can pick a working one
+-automatically instead of relying on a fixed default.
++Startup self-test that measures which combination of fragmentation
++method, ClientHello padding and fake-packet decoy gets past the local
++DPI, so NoDPI can pick working settings automatically instead of
++relying on fixed defaults.
+ 
+ `fragment_clienthello` is split out of ConnectionHandler so the proxy
+ and this self-test share a single implementation of the fragmentation
+@@ -15,15 +16,30 @@ import asyncio
+ import random
+ from typing import Dict, List, Optional, Tuple
+ 
++from utils.evasion import pad_clienthello, send_fake_packet
++
+ # Small and deliberately short: each extra domain adds up to
+-# CONNECT_TIMEOUT + READ_TIMEOUT seconds per method if it's blocked.
++# CONNECT_TIMEOUT + READ_TIMEOUT seconds per combo if it's blocked.
+ TEST_DOMAINS: List[str] = ["youtube.com", "googlevideo.com", "ytimg.com"]
+ 
+ FRAGMENT_METHODS: List[str] = ["sni", "random"]
+ 
++# Every (fragment_method, use_padding, use_fake_packet) combination to
++# try, ordered from simplest to most involved so that ties in score
++# are broken in favour of the lighter-weight option (max() keeps the
++# first entry it sees among equals).
++COMBOS: List[Tuple[str, bool, bool]] = [
++    (method, padding, fake_packet)
++    for padding in (False, True)
++    for fake_packet in (False, True)
++    for method in FRAGMENT_METHODS
++]
++
+ TLS_PORT = 443
+ CONNECT_TIMEOUT = 4.0
+ READ_TIMEOUT = 4.0
++PADDING_TEST_SIZE = 1400
++FAKE_TTL_TEST = 8
+ 
+ 
+ def _extract_sni_position(data: bytes) -> Optional[Tuple[int, int]]:
+@@ -48,12 +64,16 @@ def _extract_sni_position(data: bytes) -> Optional[Tuple[int, int]]:
+     return None
+ 
+ 
+-def fragment_clienthello(data: bytes, method: str) -> bytes:
+-    """Fragment a raw TLS ClientHello handshake payload.
++def fragment_clienthello(data: bytes, method: str) -> List[bytes]:
++    """Fragment a raw TLS ClientHello handshake payload into a list of
++    individual TLS records.
+ 
+     This is the same logic that used to live inline in
+     ConnectionHandler._handle_initial_tls_data, extracted so both the
+     live proxy path and the auto-tune self-test call one function.
++    Returns a *list* of records rather than one joined blob: sending
++    each record as its own write() is what actually makes them leave
++    as separate TCP packets (see utils/evasion.send_segmented).
+     """
+ 
+     parts: List[bytes] = []
+@@ -111,7 +131,7 @@ def fragment_clienthello(data: bytes, method: str) -> bytes:
+     else:
+         raise ValueError(f"Unknown fragmentation method: {method}")
+ 
+-    return b"".join(parts)
++    return parts
+ 
+ 
+ def build_clienthello(domain: str) -> bytes:
+@@ -155,11 +175,21 @@ def build_clienthello(domain: str) -> bytes:
+     return bytes([0x01]) + len(body).to_bytes(3, "big") + body
+ 
+ 
+-async def _probe(domain: str, method: str) -> bool:
+-    """Send one fragmented ClientHello to `domain` and report whether a
+-    TLS handshake response (not a reset, alert, or timeout) came back."""
++async def _probe(
++    domain: str,
++    method: str,
++    use_padding: bool = False,
++    use_fake_packet: bool = False,
++) -> bool:
++    """Send one fragmented (and optionally padded / preceded by a fake
++    packet) ClientHello to `domain` and report whether a TLS handshake
++    response (not a reset, alert, or timeout) came back."""
++
++    payload = build_clienthello(domain)
++    if use_padding:
++        payload = pad_clienthello(payload, PADDING_TEST_SIZE)
+ 
+-    fragments = fragment_clienthello(build_clienthello(domain), method)
++    fragments = fragment_clienthello(payload, method)
+     if not fragments:
+         return False
+ 
+@@ -171,7 +201,9 @@ async def _probe(domain: str, method: str) -> bool:
+         return False
+ 
+     try:
+-        writer.write(fragments)
++        if use_fake_packet:
++            await send_fake_packet(writer, FAKE_TTL_TEST)
++        writer.write(b"".join(fragments))
+         await writer.drain()
+         response = await asyncio.wait_for(reader.read(5), timeout=READ_TIMEOUT)
+     except Exception:
+@@ -189,36 +221,62 @@ async def _probe(domain: str, method: str) -> bool:
+     return len(response) > 0 and response[0] == 0x16
+ 
+ 
+-async def run_autotune(logger=None) -> Optional[str]:
+-    """Test every fragmentation method against a handful of commonly
+-    blocked domains and return the name of the best-performing one.
++def _combo_label(method: str, use_padding: bool, use_fake_packet: bool) -> str:
++    label = method
++    if use_padding:
++        label += "+padding"
++    if use_fake_packet:
++        label += "+fake-packet"
++    return label
++
++
++async def run_autotune(logger=None) -> Optional[Dict[str, object]]:
++    """Test every (fragment_method, padding, fake_packet) combination
++    against a handful of commonly blocked domains and return the
++    settings for the best-performing one.
+ 
+-    Returns None if every method failed against every domain, so the
+-    caller can fall back to the configured default and warn the user
+-    rather than silently picking something that doesn't work.
++    Returns None if every combination failed against every domain, so
++    the caller can fall back to the configured defaults and warn the
++    user rather than silently picking something that doesn't work.
+     """
+ 
+-    scores: Dict[str, int] = {}
++    scores: Dict[Tuple[str, bool, bool], int] = {}
+ 
+-    for method in FRAGMENT_METHODS:
++    for method, use_padding, use_fake_packet in COMBOS:
++        label = _combo_label(method, use_padding, use_fake_packet)
+         if logger:
+             logger.info(
+-                f"\033[92m[INFO]:\033[97m Auto-tune: testing '{method}' fragmentation..."
+-            )
++                f"\033[92m[INFO]:\033[97m Auto-tune: testing '{label}'...")
+         results = await asyncio.gather(
+-            *[_probe(domain, method) for domain in TEST_DOMAINS]
++            *[
++                _probe(domain, method, use_padding, use_fake_packet)
++                for domain in TEST_DOMAINS
++            ]
+         )
+-        scores[method] = sum(1 for ok in results if ok)
++        scores[(method, use_padding, use_fake_packet)] = sum(
++            1 for ok in results if ok)
+ 
+-    best_method = max(scores, key=scores.get)
++    best_combo = max(scores, key=scores.get)
+ 
+     if logger:
+         summary = ", ".join(
+-            f"{m}={s}/{len(TEST_DOMAINS)}" for m, s in scores.items()
++            f"{_combo_label(*combo)}={score}/{len(TEST_DOMAINS)}"
++            for combo, score in scores.items()
+         )
+         logger.info(f"\033[92m[INFO]:\033[97m Auto-tune results: {summary}")
+ 
+-    if scores[best_method] == 0:
++    if scores[best_combo] == 0:
+         return None
+ 
+-    return best_method
++    method, use_padding, use_fake_packet = best_combo
++    if logger:
++        logger.info(
++            f"\033[92m[INFO]:\033[97m Auto-tune selected: "
++            f"{_combo_label(method, use_padding, use_fake_packet)}"
++        )
++
++    return {
++        "fragment_method": method,
++        "use_padding": use_padding,
++        "use_fake_packet": use_fake_packet,
++    }
+diff --git patchend/src/utils/evasion.py patchend/src/utils/evasion.py
+new file mode 100644
+index 0000000..c30432c
+--- /dev/null
++++ b/src/utils/evasion.py
+@@ -0,0 +1,241 @@
++"""
++Evasion
++=======
++
++Extra DPI-evasion techniques layered on top of TLS ClientHello
++fragmentation:
++
++- Padding: grow the ClientHello with a standard RFC 7685 padding
++  extension so it no longer fits in one small packet.
++- Segmentation: send each TLS record as its own write()+drain() with
++  Nagle's algorithm disabled, so records actually leave as separate
++  TCP packets instead of being silently re-joined by a single
++  b"".join() + one write() call.
++- Fake packet: send a low-TTL decoy ClientHello (with an unrelated
++  SNI) ahead of the real one, so it reaches an on-path DPI box but
++  dies before reaching the real, further-away destination server.
++
++None of this needs raw sockets or elevated privileges - everything
++here is a standard setsockopt() call on the already-open outgoing TCP
++socket, same as the rest of NoDPI.
++"""
++
++import random
++import socket
++from typing import List, Optional, Tuple
++
++
++def set_tcp_nodelay(writer) -> None:
++    """Disable Nagle's algorithm on the outgoing socket so that
++    separate writer.write() calls actually leave as separate TCP
++    segments instead of being coalesced by the kernel."""
++
++    sock = writer.get_extra_info("socket")
++    if sock is None:
++        return
++    try:
++        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++    except OSError:
++        pass
++
++
++async def send_segmented(writer, parts: List[bytes]) -> None:
++    """Send each TLS record as its own write()+drain() instead of
++    joining everything into one buffer first. Combined with
++    TCP_NODELAY, this makes each record leave as its own TCP packet -
++    which is the actual point of "fragmentation"; concatenating the
++    records back together before a single write() undoes most of it
++    against DPI that matches on raw packet boundaries."""
++
++    set_tcp_nodelay(writer)
++    for part in parts:
++        writer.write(part)
++        await writer.drain()
++
++
++def _find_extension(extensions: bytes, ext_type: int) -> Optional[Tuple[int, int]]:
++    """Return (offset_of_length_field, payload_len) for the first
++    extension of `ext_type` inside a ClientHello extensions block, or
++    None if it isn't present."""
++
++    pos = 0
++    while pos + 4 <= len(extensions):
++        cur_type = int.from_bytes(extensions[pos: pos + 2], "big")
++        cur_len = int.from_bytes(extensions[pos + 2: pos + 4], "big")
++        if cur_type == ext_type:
++            return pos + 2, cur_len
++        pos += 4 + cur_len
++    return None
++
++
++def _parse_clienthello_offsets(handshake: bytes) -> Optional[Tuple[int, int]]:
++    """Locate the extensions_length field and the end of the
++    extensions block inside a ClientHello handshake message.
++
++    Returns (extensions_len_pos, extensions_end), or None if the
++    message is too short or doesn't parse as expected - callers should
++    leave the handshake untouched in that case rather than guess.
++    """
++
++    if len(handshake) < 4 or handshake[0] != 0x01:
++        return None
++
++    pos = 4 + 2 + 32  # handshake header + client_version + random
++    if pos >= len(handshake):
++        return None
++
++    session_id_len = handshake[pos]
++    pos += 1 + session_id_len
++    if pos + 2 > len(handshake):
++        return None
++
++    cipher_suites_len = int.from_bytes(handshake[pos: pos + 2], "big")
++    pos += 2 + cipher_suites_len
++    if pos >= len(handshake):
++        return None
++
++    compression_len = handshake[pos]
++    pos += 1 + compression_len
++    if pos + 2 > len(handshake):
++        return None
++
++    extensions_len_pos = pos
++    extensions_len = int.from_bytes(handshake[pos: pos + 2], "big")
++    extensions_end = pos + 2 + extensions_len
++    if extensions_end > len(handshake):
++        return None
++
++    return extensions_len_pos, extensions_end
++
++
++def pad_clienthello(handshake: bytes, target_size: int = 1400) -> bytes:
++    """Pad a ClientHello handshake message up to `target_size` bytes
++    using the standard RFC 7685 padding extension, so it no longer
++    fits in a single small packet. Compliant TLS servers are required
++    to ignore this extension, so it doesn't affect the handshake.
++
++    If the ClientHello already carries a padding extension (common -
++    Chrome and Firefox add one themselves), its payload is grown
++    instead of adding a duplicate, since an extension type isn't
++    supposed to repeat in one ClientHello.
++
++    Returns the handshake unchanged if it's already >= target_size, or
++    if it can't be safely parsed.
++    """
++
++    if len(handshake) >= target_size:
++        return handshake
++
++    offsets = _parse_clienthello_offsets(handshake)
++    if offsets is None:
++        return handshake
++
++    extensions_len_pos, extensions_end = offsets
++    extensions = handshake[extensions_len_pos + 2: extensions_end]
++
++    existing = _find_extension(extensions, 0x0015)
++    needed = target_size - len(handshake)
++
++    if existing is not None:
++        len_pos, cur_payload_len = existing
++        payload_end = len_pos + 2 + cur_payload_len
++        new_extensions = (
++            extensions[:len_pos]
++            + (cur_payload_len + needed).to_bytes(2, "big")
++            + extensions[len_pos + 2: payload_end]
++            + b"\x00" * needed
++            + extensions[payload_end:]
++        )
++    else:
++        if needed <= 4:
++            return handshake
++        padding_payload_len = needed - 4
++        new_extension = (
++            bytes.fromhex("0015")
++            + padding_payload_len.to_bytes(2, "big")
++            + b"\x00" * padding_payload_len
++        )
++        new_extensions = extensions + new_extension
++
++    new_handshake = (
++        handshake[:extensions_len_pos]
++        + len(new_extensions).to_bytes(2, "big")
++        + new_extensions
++        + handshake[extensions_end:]
++    )
++
++    new_body_len = len(new_handshake) - 4
++    return bytes([0x01]) + new_body_len.to_bytes(3, "big") + new_handshake[4:]
++
++
++def _build_fake_clienthello_record(decoy_sni: bytes) -> bytes:
++    """Build a complete, self-contained TLS record wrapping a minimal
++    ClientHello carrying an unrelated SNI - just enough structure for
++    a passive DPI to parse a (wrong) domain out of it."""
++
++    client_random = bytes(random.getrandbits(8) for _ in range(32))
++    session_id = b"\x00"
++    cipher_suites = bytes.fromhex("002f0035")
++    compression = bytes.fromhex("0100")
++
++    server_name = bytes([0x00]) + len(decoy_sni).to_bytes(2, "big") + decoy_sni
++    server_name_list = len(server_name).to_bytes(2, "big") + server_name
++    sni_extension = (
++        bytes.fromhex("0000")
++        + len(server_name_list).to_bytes(2, "big")
++        + server_name_list
++    )
++    extensions_len = len(sni_extension).to_bytes(2, "big")
++
++    body = (
++        bytes.fromhex("0303")
++        + client_random
++        + session_id
++        + len(cipher_suites).to_bytes(2, "big")
++        + cipher_suites
++        + compression
++        + extensions_len
++        + sni_extension
++    )
++    handshake = bytes([0x01]) + len(body).to_bytes(3, "big") + body
++
++    return bytes.fromhex("160301") + len(handshake).to_bytes(2, "big") + handshake
++
++
++async def send_fake_packet(writer, ttl: int = 8) -> None:
++    """Send a decoy TLS record ahead of the real ClientHello, with the
++    IP TTL lowered so it dies a few hops out - far enough to pass an
++    on-path DPI box, not far enough to reach the real destination.
++
++    The decoy carries a syntactically valid but unrelated SNI, so a
++    DPI that inspects it without waiting for the real handshake reads
++    the wrong domain, while the real server never receives this packet
++    and is unaffected by it either way.
++    """
++
++    sock = writer.get_extra_info("socket")
++    if sock is None:
++        return
++
++    fake = _build_fake_clienthello_record(b"www.example.com")
++
++    is_ipv6 = sock.family == socket.AF_INET6
++    opt_level = socket.IPPROTO_IPV6 if is_ipv6 else socket.IPPROTO_IP
++    opt_name = socket.IPV6_UNICAST_HOPS if is_ipv6 else socket.IP_TTL
++
++    try:
++        original_ttl = sock.getsockopt(opt_level, opt_name)
++    except OSError:
++        return
++
++    try:
++        sock.setsockopt(opt_level, opt_name, ttl)
++        writer.write(fake)
++        await writer.drain()
++    except OSError:
++        pass
++    finally:
++        try:
++            sock.setsockopt(opt_level, opt_name, original_ttl)
++        except OSError:
++            pass

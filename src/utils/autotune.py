@@ -2,9 +2,10 @@
 Auto-tune
 =========
 
-Startup self-test that measures which TLS ClientHello fragmentation
-method gets past the local DPI, so NoDPI can pick a working one
-automatically instead of relying on a fixed default.
+Startup self-test that measures which combination of fragmentation
+method, ClientHello padding and fake-packet decoy gets past the local
+DPI, so NoDPI can pick working settings automatically instead of
+relying on fixed defaults.
 
 `fragment_clienthello` is split out of ConnectionHandler so the proxy
 and this self-test share a single implementation of the fragmentation
@@ -15,15 +16,30 @@ import asyncio
 import random
 from typing import Dict, List, Optional, Tuple
 
+from utils.evasion import pad_clienthello, send_fake_packet
+
 # Small and deliberately short: each extra domain adds up to
-# CONNECT_TIMEOUT + READ_TIMEOUT seconds per method if it's blocked.
+# CONNECT_TIMEOUT + READ_TIMEOUT seconds per combo if it's blocked.
 TEST_DOMAINS: List[str] = ["youtube.com", "googlevideo.com", "ytimg.com"]
 
 FRAGMENT_METHODS: List[str] = ["sni", "random"]
 
+# Every (fragment_method, use_padding, use_fake_packet) combination to
+# try, ordered from simplest to most involved so that ties in score
+# are broken in favour of the lighter-weight option (max() keeps the
+# first entry it sees among equals).
+COMBOS: List[Tuple[str, bool, bool]] = [
+    (method, padding, fake_packet)
+    for padding in (False, True)
+    for fake_packet in (False, True)
+    for method in FRAGMENT_METHODS
+]
+
 TLS_PORT = 443
 CONNECT_TIMEOUT = 4.0
 READ_TIMEOUT = 4.0
+PADDING_TEST_SIZE = 1400
+FAKE_TTL_TEST = 8
 
 
 def _extract_sni_position(data: bytes) -> Optional[Tuple[int, int]]:
@@ -48,12 +64,16 @@ def _extract_sni_position(data: bytes) -> Optional[Tuple[int, int]]:
     return None
 
 
-def fragment_clienthello(data: bytes, method: str) -> bytes:
-    """Fragment a raw TLS ClientHello handshake payload.
+def fragment_clienthello(data: bytes, method: str) -> List[bytes]:
+    """Fragment a raw TLS ClientHello handshake payload into a list of
+    individual TLS records.
 
     This is the same logic that used to live inline in
     ConnectionHandler._handle_initial_tls_data, extracted so both the
     live proxy path and the auto-tune self-test call one function.
+    Returns a *list* of records rather than one joined blob: sending
+    each record as its own write() is what actually makes them leave
+    as separate TCP packets (see utils/evasion.send_segmented).
     """
 
     parts: List[bytes] = []
@@ -111,7 +131,7 @@ def fragment_clienthello(data: bytes, method: str) -> bytes:
     else:
         raise ValueError(f"Unknown fragmentation method: {method}")
 
-    return b"".join(parts)
+    return parts
 
 
 def build_clienthello(domain: str) -> bytes:
@@ -155,11 +175,21 @@ def build_clienthello(domain: str) -> bytes:
     return bytes([0x01]) + len(body).to_bytes(3, "big") + body
 
 
-async def _probe(domain: str, method: str) -> bool:
-    """Send one fragmented ClientHello to `domain` and report whether a
-    TLS handshake response (not a reset, alert, or timeout) came back."""
+async def _probe(
+    domain: str,
+    method: str,
+    use_padding: bool = False,
+    use_fake_packet: bool = False,
+) -> bool:
+    """Send one fragmented (and optionally padded / preceded by a fake
+    packet) ClientHello to `domain` and report whether a TLS handshake
+    response (not a reset, alert, or timeout) came back."""
 
-    fragments = fragment_clienthello(build_clienthello(domain), method)
+    payload = build_clienthello(domain)
+    if use_padding:
+        payload = pad_clienthello(payload, PADDING_TEST_SIZE)
+
+    fragments = fragment_clienthello(payload, method)
     if not fragments:
         return False
 
@@ -171,7 +201,9 @@ async def _probe(domain: str, method: str) -> bool:
         return False
 
     try:
-        writer.write(fragments)
+        if use_fake_packet:
+            await send_fake_packet(writer, FAKE_TTL_TEST)
+        writer.write(b"".join(fragments))
         await writer.drain()
         response = await asyncio.wait_for(reader.read(5), timeout=READ_TIMEOUT)
     except Exception:
@@ -189,36 +221,62 @@ async def _probe(domain: str, method: str) -> bool:
     return len(response) > 0 and response[0] == 0x16
 
 
-async def run_autotune(logger=None) -> Optional[str]:
-    """Test every fragmentation method against a handful of commonly
-    blocked domains and return the name of the best-performing one.
+def _combo_label(method: str, use_padding: bool, use_fake_packet: bool) -> str:
+    label = method
+    if use_padding:
+        label += "+padding"
+    if use_fake_packet:
+        label += "+fake-packet"
+    return label
 
-    Returns None if every method failed against every domain, so the
-    caller can fall back to the configured default and warn the user
-    rather than silently picking something that doesn't work.
+
+async def run_autotune(logger=None) -> Optional[Dict[str, object]]:
+    """Test every (fragment_method, padding, fake_packet) combination
+    against a handful of commonly blocked domains and return the
+    settings for the best-performing one.
+
+    Returns None if every combination failed against every domain, so
+    the caller can fall back to the configured defaults and warn the
+    user rather than silently picking something that doesn't work.
     """
 
-    scores: Dict[str, int] = {}
+    scores: Dict[Tuple[str, bool, bool], int] = {}
 
-    for method in FRAGMENT_METHODS:
+    for method, use_padding, use_fake_packet in COMBOS:
+        label = _combo_label(method, use_padding, use_fake_packet)
         if logger:
             logger.info(
-                f"\033[92m[INFO]:\033[97m Auto-tune: testing '{method}' fragmentation..."
-            )
+                f"\033[92m[INFO]:\033[97m Auto-tune: testing '{label}'...")
         results = await asyncio.gather(
-            *[_probe(domain, method) for domain in TEST_DOMAINS]
+            *[
+                _probe(domain, method, use_padding, use_fake_packet)
+                for domain in TEST_DOMAINS
+            ]
         )
-        scores[method] = sum(1 for ok in results if ok)
+        scores[(method, use_padding, use_fake_packet)] = sum(
+            1 for ok in results if ok)
 
-    best_method = max(scores, key=scores.get)
+    best_combo = max(scores, key=scores.get)
 
     if logger:
         summary = ", ".join(
-            f"{m}={s}/{len(TEST_DOMAINS)}" for m, s in scores.items()
+            f"{_combo_label(*combo)}={score}/{len(TEST_DOMAINS)}"
+            for combo, score in scores.items()
         )
         logger.info(f"\033[92m[INFO]:\033[97m Auto-tune results: {summary}")
 
-    if scores[best_method] == 0:
+    if scores[best_combo] == 0:
         return None
 
-    return best_method
+    method, use_padding, use_fake_packet = best_combo
+    if logger:
+        logger.info(
+            f"\033[92m[INFO]:\033[97m Auto-tune selected: "
+            f"{_combo_label(method, use_padding, use_fake_packet)}"
+        )
+
+    return {
+        "fragment_method": method,
+        "use_padding": use_padding,
+        "use_fake_packet": use_fake_packet,
+    }

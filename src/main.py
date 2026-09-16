@@ -28,13 +28,14 @@ from urllib.error import URLError
 from urllib.request import urlopen, Request
 
 from utils.autotune import fragment_clienthello, run_autotune
+from utils.evasion import pad_clienthello, send_fake_packet, send_segmented
 
 if sys.platform == "win32":
     import winreg
 
     from utils.tray import WindowsTrayIcon
 
-__version__ = "2.3"
+__version__ = "2.4"
 
 if sys.platform == "win32":
     os.system("")
@@ -71,6 +72,10 @@ class ProxyConfig:
         self.no_blacklist = False
         self.auto_blacklist = False
         self.auto_tune = False
+        self.use_padding = False
+        self.padding_size = 1400
+        self.use_fake_packet = False
+        self.fake_ttl = 8
         self.quiet = False
         self.start_in_tray = False
 
@@ -777,12 +782,19 @@ class ConnectionHandler(IConnectionHandler):
         self.statistics.increment_total_connections()
         self.statistics.increment_blocked_connections()
 
-        combined_parts = fragment_clienthello(data, self.config.fragment_method)
-        writer.write(combined_parts)
-        await writer.drain()
+        payload = data
+        if self.config.use_padding:
+            payload = pad_clienthello(payload, self.config.padding_size)
 
-        self.statistics.update_traffic(0, len(combined_parts))
-        conn_info.traffic_out += len(combined_parts)
+        if self.config.use_fake_packet:
+            await send_fake_packet(writer, self.config.fake_ttl)
+
+        parts = fragment_clienthello(payload, self.config.fragment_method)
+        await send_segmented(writer, parts)
+
+        total_len = sum(len(part) for part in parts)
+        self.statistics.update_traffic(0, total_len)
+        conn_info.traffic_out += total_len
 
     async def _setup_piping(
         self,
@@ -1182,6 +1194,10 @@ class ConfigLoader:
         config.no_blacklist = args.no_blacklist
         config.auto_blacklist = args.autoblacklist
         config.auto_tune = args.auto_tune
+        config.use_padding = args.padding
+        config.padding_size = args.padding_size
+        config.use_fake_packet = args.fake_packet
+        config.fake_ttl = args.fake_ttl
         config.quiet = args.quiet
         config.start_in_tray = args.start_in_tray
         return config
@@ -1362,6 +1378,30 @@ class ProxyApplication:
                  "and automatically use whichever gets past local DPI "
                  "(overrides --fragment-method if it finds a working one)",
         )
+        parser.add_argument(
+            "--padding",
+            action="store_true",
+            help="Pad the ClientHello with a standard RFC 7685 padding extension "
+                 "so it no longer fits in one small packet",
+        )
+        parser.add_argument(
+            "--padding-size",
+            type=int,
+            default=1400,
+            help="Target ClientHello size in bytes when --padding is used (default: 1400)",
+        )
+        parser.add_argument(
+            "--fake-packet",
+            action="store_true",
+            help="Send a low-TTL decoy ClientHello (wrong SNI) before the real one, "
+                 "so on-path DPI reads the wrong domain",
+        )
+        parser.add_argument(
+            "--fake-ttl",
+            type=int,
+            default=8,
+            help="IP TTL for the decoy packet sent by --fake-packet (default: 8)",
+        )
 
         parser.add_argument(
             "--auth-username", required=False, help="Username for proxy authentication"
@@ -1440,14 +1480,14 @@ class ProxyApplication:
         if config.auto_tune:
             logger.info(
                 "\033[92m[INFO]:\033[97m Auto-tune enabled, probing fragmentation methods...")
-            best_method = await run_autotune(logger)
-            if best_method:
-                config.fragment_method = best_method
-                logger.info(
-                    f"\033[92m[INFO]:\033[97m Auto-tune selected fragmentation method: {best_method}")
+            best = await run_autotune(logger)
+            if best:
+                config.fragment_method = best["fragment_method"]
+                config.use_padding = best["use_padding"]
+                config.use_fake_packet = best["use_fake_packet"]
             else:
                 logger.error(
-                    f"\033[91m[WARN]:\033[97m Auto-tune found no working fragmentation method "
+                    f"\033[91m[WARN]:\033[97m Auto-tune found no working combination "
                     f"against the test domains; keeping '{config.fragment_method}'. "
                     f"This may mean your ISP blocks by IP, not just SNI - fragmentation "
                     f"alone won't help in that case."
