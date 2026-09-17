@@ -66,13 +66,23 @@ NoDPI запускает на вашем компьютере прокси-се�
 
 *Фрагментация по SNI (по умолчанию)*
 
-В пакете есть поле, содержащее запись SNI. ClientHello разбивается на несколько TLS-записей: часть до SNI, SNI посимвольно, и часть после SNI. К каждой части прикрепляется заголовок, указывающий на тип Clienthello, и затем все это отправляется в одном пакете.
+В пакете есть поле, содержащее запись SNI. ClientHello разбивается на несколько TLS-записей: часть до SNI, SNI посимвольно, и часть после SNI. К каждой части прикрепляется заголовок, указывающий на тип Clienthello, и затем каждая запись отправляется отдельным TCP-пакетом.
 
 *Случайная фрагментация*
 
-ClientHello разбивается на несколько частей случайной длины. Каждая часть склеивается префиксами типа ClientHello, и всё это отправляется одним пакетом.
+ClientHello разбивается на несколько частей случайной длины. Каждая часть склеивается префиксами типа ClientHello, и каждая часть отправляется отдельным TCP-пакетом.
 
 Также, независимо от способа, версия TLS заменяется на версию 1.3, которая является самой современной на данный момент (хотя это не означает, что ваши данные начинают передаваться в соответствии со спецификациями этой версии). Всё это в совокупности позволяет обойти блокировку. По всей видимости, DPI пока не обладает необходимыми мощностями, чтобы распутать этот «клубок», и просто игнорирует такой трафик, экономя время и силы. Но, возможно, скоро эти методы перестанут работать.
+
+**Дополнительные методы обхода (опционально)**
+
+Поверх фрагментации можно включить ещё три техники:
+
+- `--padding` дополняет ClientHello стандартным TLS-расширением padding (RFC 7685), чтобы пакет не помещался в один маленький сегмент и доставлялся несколькими пакетами.
+- `--fake-packet` отправляет перед настоящим ClientHello поддельный (с чужим SNI) с заниженным TTL (`--fake-ttl`), так что его видит DPI-коробка провайдера, но он не долетает до настоящего сервера.
+- `--auto-tune` при запуске быстро тестирует несколько известно блокируемых доменов, перебирая все комбинации метода фрагментации, padding и fake-packet, и сам включает ту комбинацию, которая реально прошла через DPI — без ручного подбора.
+
+Ничего из этого не требует raw-сокетов или прав администратора/root.
 
 > [!IMPORTANT]
 > NoDPI работает только с HTTPS-трафиком. Он также может принимать HTTP-трафик, но исключительно для совместимости — HTTP-сайты практически не подлежат разблокировке, и программа просто отправляет трафик адресату.
@@ -164,10 +174,43 @@ NoDPI не собирает и не отправляет никаких данн
 ### Поддерживаемые аргументы командной строки
 
 ```
-usage: nodpi [-h] [--host HOST] [--port PORT] [--out-host OUT_HOST] 
-[--blacklist BLACKLIST | --no-blacklist | --autoblacklist]
-               [--fragment-method {sni,random}] 
-               [--domain-matching {loose,strict}] 
+usage: nodpi [-h] [--host HOST] [--port PORT] [--out-host OUT_HOST]
+               [--blacklist BLACKLIST | --no-blacklist | --autoblacklist]
+               [--fragment-method {sni,random}]
+               [--domain-matching {loose,strict}] [--auto-tune] [--padding]
+               [--padding-size PADDING_SIZE] [--fake-packet]
+               [--fake-ttl FAKE_TTL] [--auth-username AUTH_USERNAME]
+               [--auth-password AUTH_PASSWORD] [--log-access LOG_ACCESS]
+               [--log-error LOG_ERROR] [-q] [--start-in-tray]
+               [--install | --uninstall]
+
+options:
+  -h, --help            show this help message and exit
+  --host HOST           Proxy host
+  --port PORT           Proxy port
+  --out-host OUT_HOST   Outgoing proxy host
+  --blacklist BLACKLIST
+                        Path to blacklist file
+  --no-blacklist        Use fragmentation for all domains
+  --autoblacklist       Automatic detection of blocked domains
+  --fragment-method {sni,random}
+                        Fragmentation method (sni by default)
+  --domain-matching {loose,strict}
+                        Domain matching mode (strict by default)
+  --auto-tune           On startup, probe fragmentation methods (and, in
+                        combination with padding/fake-packet, all 8
+                        combinations of the settings below) against test
+                        domains and automatically use whichever gets past
+                        local DPI
+  --padding             Pad the ClientHello with a standard RFC 7685 padding
+                        extension so it no longer fits in one small packet
+  --padding-size PADDING_SIZE
+                        Target ClientHello size in bytes when --padding is
+                        used (default: 1400)
+  --fake-packet         Send a low-TTL decoy ClientHello (wrong SNI) before
+                        the real one, so on-path DPI reads the wrong domain
+  --fake-ttl FAKE_TTL   IP TTL for the decoy packet sent by --fake-packet
+                        (default: 8)
                [--auth-username AUTH_USERNAME] [--auth-password AUTH_PASSWORD] 
                [--log-access LOG_ACCESS] [--log-error LOG_ERROR] 
                [-q] [--start-in-tray]
